@@ -429,6 +429,7 @@ Master Repository/Issues:
 """
 
 from dnslib.dns import *
+from dnslib.ixfr import DNSZone,ZoneTransferError,apply_ixfr,serial_lt
 
 version = "0.9.26"
 
