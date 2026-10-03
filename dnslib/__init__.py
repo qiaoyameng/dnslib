@@ -429,6 +429,7 @@ Master Repository/Issues:
 """
 
 from dnslib.dns import *
+from dnslib.update import DNSUpdate
 
 version = "0.9.26"
 

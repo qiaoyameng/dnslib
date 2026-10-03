@@ -113,6 +113,13 @@ class DNSRecord(object):
         buffer = DNSBuffer(packet)
         try:
             header = DNSHeader.parse(buffer)
+            # RFC2136 DNS UPDATE messages reuse the standard section layout
+            # (zone/prerequisite/update/additional) with different parsing
+            # rules - delegate to the UPDATE class (lazy import avoids a
+            # circular import)
+            if header.opcode == OPCODE.UPDATE and cls is DNSRecord:
+                from dnslib.update import DNSUpdate
+                return DNSUpdate._parse_update(buffer,header)
             questions = []
             rr = []
             auth = []
@@ -666,9 +673,14 @@ class DNSHeader(object):
               self.cd and 'cd' ]
         z1 = ';; ->>HEADER<<- opcode: %s, status: %s, id: %d' % (
                     OPCODE.get(self.opcode),RCODE.get(self.rcode),self.id)
-        z2 = ';; flags: %s; QUERY: %d, ANSWER: %d, AUTHORITY: %d, ADDITIONAL: %d' % (
-                      " ".join(filter(None,f)),
-                      self.q,self.a,self.auth,self.ar)
+        if OPCODE.get(self.opcode) == 'UPDATE':
+            z2 = ';; flags: %s; ZONE: %d, PREREQUISITE: %d, UPDATE: %d, ADDITIONAL: %d' % (
+                          " ".join(filter(None,f)),
+                          self.q,self.a,self.auth,self.ar)
+        else:
+            z2 = ';; flags: %s; QUERY: %d, ANSWER: %d, AUTHORITY: %d, ADDITIONAL: %d' % (
+                          " ".join(filter(None,f)),
+                          self.q,self.a,self.auth,self.ar)
         return z1 + "\n" + z2
 
     def __str__(self):
@@ -811,7 +823,7 @@ class RR(object):
     rdlength = H('rdlength')
 
     @classmethod
-    def parse(cls,buffer):
+    def parse(cls,buffer,allow_empty=False):
         try:
             rname = buffer.decode_name()
             rtype,rclass,ttl,rdlength = buffer.unpack("!HHIH")
@@ -827,6 +839,13 @@ class RR(object):
                 if rdlength:
                     rdata = RDMAP.get(QTYPE.get(rtype),RD).parse(
                                             buffer,rdlength)
+                elif allow_empty:
+                    # RFC2136 UPDATE context - zero length RDATA is legal
+                    # for the wildcard RRsets used in the prerequisite and
+                    # update sections (stored as an opaque empty RD so the
+                    # RR semantics are determined by section context, not
+                    # by guessing from the rtype)
+                    rdata = RD(b"")
                 else:
                     raise DNSError("Error: Empty RR")
             return cls(rname,rtype,rclass,ttl,rdata)
