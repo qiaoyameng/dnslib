@@ -339,10 +339,28 @@ class DNSRecord(object):
             ar.pack(buffer)
         return buffer.data
 
-    def truncate(self):
+    def truncate(self,udplen=None):
         """
-            Return truncated copy of DNSRecord (with TC flag set)
-            (removes all Questions & RRs and just returns header)
+            Return a copy of the DNS record which fits in ``udplen`` wire
+            bytes. When ``udplen`` is omitted, use the UDP payload size
+            declared by OPT, or 512 when there is no OPT record.
+
+            The question section is always retained. Ordinary RRsets are
+            removed from the tail of the additional, authority and answer
+            sections in that order. Records with the same name, type and
+            class form one RRset, even when duplicate records are not
+            contiguous, so an RRset is never partially removed.
+
+            OPT is a pseudo-RR and is handled separately: one OPT record is
+            retained where possible and kept out of ordinary RRset pruning.
+            Its class field is the responder UDP payload size, not a DNS
+            class. An explicit responder limit is written to the returned
+            OPT copy (minimum 512); a size taken from the request OPT is left
+            unchanged. OPT is omitted whole only when it does not fit.
+
+            The returned packet is encoded afresh, so name compression and
+            all section counts are recalculated. If even the header and
+            question section do not fit, DNSError is raised.
 
             >>> q = DNSRecord.question("abc.com")
             >>> a = q.reply()
@@ -354,12 +372,89 @@ class DNSRecord(object):
             >>> t = a.truncate()
             >>> print(t)
             ;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: ...
-            ;; flags: qr aa tc rd ra; QUERY: 0, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 0
+            ;; flags: qr aa tc rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 0
+            ;; QUESTION SECTION:
+            ;abc.com.                       IN      A
 
         """
-        return DNSRecord(DNSHeader(id=self.header.id,
-                                   bitmap=self.header.bitmap,
-                                   tc=1))
+        explicit_udplen = udplen
+        if explicit_udplen is not None and (
+            not isinstance(explicit_udplen,int) or explicit_udplen <= 0
+        ):
+            raise DNSError("Invalid UDP packet length: %r" % explicit_udplen)
+
+        request_opt = next(
+            (rr for rr in self.ar if rr.rtype == QTYPE.OPT),None)
+        if udplen is None:
+            if request_opt is not None:
+                udplen = max(512,request_opt.rclass)
+            else:
+                udplen = 512
+
+        questions = copy.deepcopy(self.questions)
+        answers = copy.deepcopy(self.rr)
+        authority = copy.deepcopy(self.auth)
+        additional = []
+        options = []
+        for rr in copy.deepcopy(self.ar):
+            if rr.rtype == QTYPE.OPT and not options:
+                options.append(rr)
+            elif rr.rtype != QTYPE.OPT:
+                additional.append(rr)
+
+        opt = options[0] if options else None
+        if opt is not None and explicit_udplen is not None:
+            opt.rclass = max(512,explicit_udplen)
+            opt.edns_len = opt.rclass
+
+        def build(include_opt=True):
+            ar = list(additional)
+            if include_opt and opt is not None:
+                ar.append(opt)
+            record = DNSRecord(
+                        DNSHeader(id=self.header.id,
+                                  bitmap=self.header.bitmap),
+                        questions=questions,
+                        rr=answers,
+                        auth=authority,
+                        ar=ar)
+            return record,record.pack()
+
+        truncated,packet = build(include_opt=False)
+        _,original_packet = build(include_opt=True)
+        is_truncated = len(original_packet) > udplen
+
+        if is_truncated:
+            truncated.header.tc = 1
+            for section in (additional,authority,answers):
+                while section:
+                    last = section[-1]
+                    rrset = (last.rname,last.rtype,last.rclass)
+                    section[:] = [
+                        rr for rr in section
+                        if (rr.rname,rr.rtype,rr.rclass) != rrset
+                    ]
+                    truncated,packet = build(include_opt=False)
+                    truncated.header.tc = 1
+                    if len(packet) <= udplen:
+                        break
+
+                if len(packet) <= udplen:
+                    break
+
+        if len(packet) <= udplen and opt is not None:
+            with_opt,packet_with_opt = build(include_opt=True)
+            if len(packet_with_opt) <= udplen:
+                with_opt.header.tc = 1 if is_truncated else self.header.tc
+                truncated,packet = with_opt,packet_with_opt
+            else:
+                truncated.header.tc = 1
+
+        if len(packet) > udplen:
+            raise DNSError(
+                "DNS header and question section do not fit in %d bytes" %
+                udplen)
+        return truncated
 
     def send(self,dest,port=53,tcp=False,timeout=None,ipv6=False):
         """
