@@ -32,6 +32,7 @@ jobs:
         python dnslib/server.py 
         python dnslib/digparser.py 
         python dnslib/ranges.py -
-        python dnslib/test_decode.py 
+        python dnslib/test_decode.py
+        python -m unittest dnslib.test_zoneparser
         python fuzz.py
         

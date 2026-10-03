@@ -835,11 +835,14 @@ class RR(object):
                                 buffer.offset,e))
 
     @classmethod
-    def fromZone(cls,zone,origin="",ttl=0):
+    def fromZone(cls,zone,origin="",ttl=0,max_generate_records=10000):
         """
             Parse RR data from zone file and return list of RRs
         """
-        return list(ZoneParser(zone,origin=origin,ttl=ttl))
+        return list(ZoneParser(zone,
+                               origin=origin,
+                               ttl=ttl,
+                               max_generate_records=max_generate_records))
 
     def __init__(self,rname=None,rtype=1,rclass=1,ttl=0,rdata=None):
         self.rname = rname
@@ -2496,6 +2499,328 @@ def parse_time(s):
     else:
         return int(s)
 
+_generate_width_limit = 1024
+_generate_number_limit = (1 << 64) - 1
+
+class ZoneParseError(DNSError):
+    pass
+
+def _generate_int(value,line):
+    if not value:
+        raise ZoneParseError("$GENERATE directive on line %d: empty number" %
+                             line)
+    try:
+        if value.startswith(('0x','0X')):
+            digits = value[2:]
+            if not digits or not all(c in '0123456789abcdefABCDEF' for c in digits):
+                raise ValueError("invalid hexadecimal number")
+            result = int(value,16)
+        elif value.startswith('0') and len(value) > 1:
+            if not all(c in '01234567' for c in value):
+                raise ValueError("invalid octal number")
+            result = int(value,8)
+        elif all(c in '0123456789' for c in value):
+            result = int(value,10)
+        else:
+            raise ValueError("number must be decimal, octal or hexadecimal")
+        if result < 0 or result > _generate_number_limit:
+            raise ValueError("number must be between 0 and 2^64-1")
+        return result
+    except ValueError as e:
+        raise ZoneParseError(
+            "$GENERATE directive on line %d: invalid number %r (%s)" %
+            (line,value,e))
+
+def _signed_decimal(value):
+    digits = value[1:] if value[:1] in '+-' else value
+    return (value and
+            bool(digits) and
+            all(c in '0123456789' for c in digits))
+
+def _generate_value(number,spec,line):
+    offset = 0
+    width = 0
+    base = 'd'
+    uppercase = False
+
+    if spec:
+        parts = spec.split(',')
+        if len(parts) > 3:
+            raise ZoneParseError(
+                "$GENERATE directive on line %d: invalid substitution %r" %
+                (line,'${%s}' % spec))
+        try:
+            if parts[0] and not _signed_decimal(parts[0]):
+                raise ValueError("invalid offset")
+            offset = int(parts[0],10) if parts[0] else 0
+            if len(parts) > 1 and parts[1]:
+                if not all(c in '0123456789' for c in parts[1]):
+                    raise ValueError("invalid width")
+                width = int(parts[1],10)
+            if len(parts) > 2 and parts[2]:
+                base = parts[2]
+                if base in ('X','N'):
+                    uppercase = True
+                    base = base.lower()
+        except ValueError:
+            raise ZoneParseError(
+                "$GENERATE directive on line %d: invalid substitution %r" %
+                (line,'${%s}' % spec))
+
+    value = number + offset
+    if width < 0 or width > _generate_width_limit:
+        raise ZoneParseError(
+            "$GENERATE directive on line %d: invalid width %d" %
+            (line,width))
+    if base == 'd':
+        text = str(value)
+    elif base == 'o':
+        text = format(value,'o')
+    elif base == 'x':
+        text = format(value,'X' if uppercase else 'x')
+    elif base == 'n':
+        if value < 0:
+            raise ZoneParseError(
+                "$GENERATE directive on line %d: nibble value cannot be negative" %
+                line)
+        text = format(value,'x')
+        if width:
+            text = text.zfill(width)
+        nibbles = list(text)
+        if uppercase:
+            nibbles = [n.upper() for n in nibbles]
+        return '.'.join(reversed(nibbles))
+    else:
+        raise ZoneParseError(
+            "$GENERATE directive on line %d: invalid base %r" %
+            (line,base))
+
+    if width:
+        if value < 0:
+            return ('-' + text[1:].zfill(width - 1)) if width > 1 else text
+        return text.zfill(width)
+    return text
+
+def _generate_substitute(template,number,line):
+    result = []
+    i = 0
+    while i < len(template):
+        c = template[i]
+        if c == '\\' and i + 1 < len(template):
+            if template[i + 1] == '$':
+                result.append('$')
+                i += 2
+            else:
+                result.append(template[i:i + 2])
+                i += 2
+        elif c == '$':
+            if i + 1 < len(template) and template[i + 1] == '{':
+                end = template.find('}',i + 2)
+                if end < 0:
+                    raise ZoneParseError(
+                        "$GENERATE directive on line %d: unterminated substitution" %
+                        line)
+                result.append(_generate_value(number,template[i + 2:end],line))
+                i = end + 1
+            else:
+                result.append(_generate_value(number,'',line))
+                i += 1
+        else:
+            result.append(c)
+            i += 1
+    return ''.join(result)
+
+def _generate_tokens(text,line):
+    tokens = []
+    i = 0
+    while i < len(text):
+        while i < len(text) and text[i] in ' \t':
+            i += 1
+        if i >= len(text) or text[i] == ';':
+            break
+        start = i
+        quote = None
+        escaped = False
+        while i < len(text):
+            c = text[i]
+            if quote:
+                if c == '\\':
+                    i += 1
+                    if i >= len(text):
+                        raise ZoneParseError(
+                            "$GENERATE directive on line %d: unterminated escape" %
+                            line)
+                    i += 1
+                    continue
+                if c == quote:
+                    quote = None
+                i += 1
+            elif c in ('"',"'"):
+                quote = c
+                i += 1
+            elif escaped:
+                escaped = False
+                i += 1
+            elif c == '\\':
+                escaped = True
+                i += 1
+            elif c in ' \t;':
+                break
+            else:
+                i += 1
+        if quote:
+            raise ZoneParseError(
+                "$GENERATE directive on line %d: unterminated quoted string" %
+                line)
+        if escaped:
+            raise ZoneParseError(
+                "$GENERATE directive on line %d: unterminated escape" %
+                line)
+        tokens.append(text[start:i])
+    return tokens
+
+def _parse_generate_directive(text,line,max_records):
+    tokens = _generate_tokens(text,line)
+    if len(tokens) < 4:
+        raise ZoneParseError(
+            "$GENERATE directive on line %d: expected range owner [ttl] [class] type rdata" %
+            line)
+
+    range_text = tokens[0]
+    range_parts = range_text.split('/')
+    if len(range_parts) > 2:
+        raise ZoneParseError(
+            "$GENERATE directive on line %d: invalid range %r" %
+            (line,range_text))
+    bounds = range_parts[0].split('-')
+    if len(bounds) != 2:
+        raise ZoneParseError(
+            "$GENERATE directive on line %d: range must be start-stop[/step]" %
+            line)
+    start = _generate_int(bounds[0],line)
+    stop = _generate_int(bounds[1],line)
+    step = 1
+    if len(range_parts) == 2:
+        step = _generate_int(range_parts[1],line)
+    if step <= 0 or start > stop:
+        raise ZoneParseError(
+            "$GENERATE directive on line %d: invalid range %r" %
+            (line,range_text))
+    count = (stop - start) // step + 1
+    if count > max_records:
+        raise ZoneParseError(
+            "$GENERATE directive on line %d: expansion count %d exceeds limit %d" %
+            (line,count,max_records))
+
+    owner = tokens[1]
+    pos = 2
+    ttl = None
+    rclass = None
+    while pos < len(tokens) - 2:
+        token = tokens[pos]
+        if token in ('IN','CH','HS') and rclass is None:
+            rclass = token
+            pos += 1
+        elif token and token[0].isdigit() and ttl is None:
+            try:
+                parse_time(token)
+            except ValueError:
+                raise ZoneParseError(
+                    "$GENERATE directive on line %d: invalid TTL %r" %
+                    (line,token))
+            ttl = token
+            pos += 1
+        else:
+            break
+    if pos >= len(tokens) - 1:
+        raise ZoneParseError(
+            "$GENERATE directive on line %d: missing record type or RDATA" %
+            line)
+    rtype = tokens[pos]
+    rdata_tokens = tokens[pos + 1:]
+
+    records = []
+    number = start
+    while number <= stop:
+        record = [_generate_substitute(owner,number,line)]
+        if ttl is not None:
+            record.append(ttl)
+        if rclass is not None:
+            record.append(rclass)
+        record.append(rtype)
+        expanded_rdata = []
+        for token in rdata_tokens:
+            expanded = _generate_substitute(token,number,line)
+            if rtype in ('TXT','SPF') and expanded[:1] not in ('"',"'"):
+                expanded = '"%s"' % expanded
+            expanded_rdata.append(expanded)
+        record.append(' '.join(expanded_rdata))
+        records.append(' '.join(record))
+        number += step
+    return records
+
+def _preprocess_zone(zone,max_records):
+    if hasattr(zone,'read'):
+        data = zone.read()
+        if isinstance(data,bytes):
+            data = data.decode()
+        lines = data.splitlines(True)
+    elif isinstance(zone,bytes):
+        lines = zone.decode().splitlines(True)
+    else:
+        lines = zone.splitlines(True)
+
+    output = []
+    source_lines = {}
+    output_line = 0
+    paren = False
+    quote = None
+
+    for line_number,line in enumerate(lines,1):
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        directive = stripped[:len('$GENERATE')].upper()
+        if stripped and not stripped.startswith(';') and directive == '$GENERATE' and \
+                (len(stripped.rstrip('\r\n')) == len('$GENERATE') or
+                 stripped[len('$GENERATE')] in ' \t'):
+            if paren:
+                raise ZoneParseError(
+                    "$GENERATE directive on line %d: directive cannot span parentheses" %
+                    line_number)
+            body = line[indent + len('$GENERATE'):].rstrip('\r\n').strip()
+            for record in _parse_generate_directive(body,line_number,max_records):
+                output.append(record + '\n')
+                output_line += 1
+                source_lines[output_line] = line_number
+        else:
+            output.append(line if line.endswith(('\n','\r')) else line + '\n')
+            output_line += 1
+            source_lines[output_line] = line_number
+            if not stripped.startswith(';'):
+                text = line
+                i = 0
+                while i < len(text):
+                    c = text[i]
+                    if quote:
+                        if c == '\\':
+                            i += 1
+                            if i < len(text):
+                                i += 1
+                            continue
+                        if c == quote:
+                            quote = None
+                    elif c in ('"',"'"):
+                        quote = c
+                    elif c == ';':
+                        break
+                    elif c == '(':
+                        paren = True
+                    elif c == ')':
+                        paren = False
+                    i += 1
+
+    return ''.join(output),source_lines
+
 class ZoneParser:
 
     """
@@ -2506,8 +2831,10 @@ class ZoneParser:
         [<DNS RR: 'www.example.com.' rtype=A rclass=IN ttl=60 rdata='1.2.3.4'>]
     """
 
-    def __init__(self,zone,origin="",ttl=0):
-        self.l = WordLexer(zone)
+    def __init__(self,zone,origin="",ttl=0,max_generate_records=10000):
+        self.zone_text,self.source_lines = _preprocess_zone(
+            zone,max_generate_records)
+        self.l = WordLexer(self.zone_text)
         self.l.commentchars = ';'
         self.l.nltok = ('NL',None)
         self.l.spacetok = ('SPACE',None)
@@ -2539,8 +2866,15 @@ class ZoneParser:
 
     def parse_rr(self,rr):
         label = self.parse_label(rr.pop(0))
-        ttl = int(rr.pop(0)) if rr[0].isdigit() else self.ttl
-        rclass = rr.pop(0) if rr[0] in ('IN','CH','HS') else 'IN'
+        ttl = self.ttl
+        rclass = 'IN'
+        while rr:
+            if rr[0] in ('IN','CH','HS'):
+                rclass = rr.pop(0)
+            elif rr[0] and rr[0][0].isdigit():
+                ttl = parse_time(rr.pop(0))
+            else:
+                break
         rtype = rr.pop(0)
         rdata = rr
         rd = RDMAP.get(rtype,RD)
@@ -2556,13 +2890,21 @@ class ZoneParser:
     def parse(self):
         rr = []
         paren = False
+        line = 1
         try:
             while True:
                 tok,val = next(self.i)
                 if tok == 'NL':
+                    current_line = line
+                    line += 1
                     if not paren and rr:
                         self.prev = tok
-                        yield self.parse_rr(rr)
+                        try:
+                            yield self.parse_rr(rr)
+                        except (DNSError,ValueError,BimapError) as e:
+                            raise ZoneParseError(
+                                "Zone record error on line %d: %s" %
+                                (self.source_lines.get(current_line,current_line),e))
                         rr = []
                 elif tok == 'SPACE' and self.prev == 'NL' and not paren:
                     rr.append('')
@@ -2582,9 +2924,20 @@ class ZoneParser:
                     else:
                         rr.append(val)
                 self.prev = tok
+        except ZoneParseError:
+            raise
+        except ValueError as e:
+            raise ZoneParseError(
+                "Zone parse error near line %d: %s" %
+                (self.source_lines.get(line,line),e))
         except StopIteration:
             if rr:
-                yield self.parse_rr(rr)
+                try:
+                    yield self.parse_rr(rr)
+                except (DNSError,ValueError,BimapError) as e:
+                    raise ZoneParseError(
+                        "Zone record error on line %d: %s" %
+                        (self.source_lines.get(line,line),e))
 
 if __name__ == '__main__':
     import doctest,sys
