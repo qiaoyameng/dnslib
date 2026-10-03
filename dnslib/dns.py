@@ -339,27 +339,202 @@ class DNSRecord(object):
             ar.pack(buffer)
         return buffer.data
 
-    def truncate(self):
+    def truncate(self,max_len=None):
         """
-            Return truncated copy of DNSRecord (with TC flag set)
-            (removes all Questions & RRs and just returns header)
+            Return truncated copy of DNSRecord which packs to at most
+            max_len bytes (setting the TC flag if records were removed)
+
+            The header and question section are always preserved.
+            Records are removed in whole RRsets - all records with the
+            same name/type/class are treated as a single group and
+            removed together (even if they are not adjacent in the
+            section) - starting from the tail of the additional
+            section, then the authority section and finally the answer
+            section, until the record packs to at most max_len bytes.
+
+            OPT pseudo-records are handled specially: they never form
+            part of an RRset and are always retained (the client still
+            needs the EDNS parameters in a truncated response). If
+            max_len is not specified it defaults to the UDP payload
+            size advertised in the record's OPT pseudo-record (or the
+            standard 512 byte UDP limit if there isn't one).
+
+            Raises DNSError if the header and question section (plus
+            any OPT records) cannot fit within max_len.
+
+            The truncated record is packed from scratch so name
+            compression pointers and section counts are always
+            recalculated. The original record is not modified.
 
             >>> q = DNSRecord.question("abc.com")
             >>> a = q.reply()
-            >>> a.add_answer(*RR.fromZone('abc.com IN TXT %s' % ('x' * 255)))
-            >>> a.add_answer(*RR.fromZone('abc.com IN TXT %s' % ('x' * 255)))
-            >>> a.add_answer(*RR.fromZone('abc.com IN TXT %s' % ('x' * 255)))
+            >>> a.add_answer(*RR.fromZone('a.abc.com IN TXT %s' % ('x' * 255)))
+            >>> a.add_answer(*RR.fromZone('b.abc.com IN TXT %s' % ('y' * 255)))
+            >>> a.add_answer(*RR.fromZone('c.abc.com IN TXT %s' % ('z' * 255)))
             >>> len(a.pack())
-            829
+            835
+
+            Truncate to default 512 byte limit - keeps question and as
+            many trailing RRsets as fit (sets TC):
+
             >>> t = a.truncate()
+            >>> 25 + 270 <= 512 < 25 + 270 + 270
+            True
+            >>> len(t.pack()) <= 512
+            True
             >>> print(t)
             ;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: ...
-            ;; flags: qr aa tc rd ra; QUERY: 0, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 0
+            ;; flags: qr aa tc rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0
+            ;; QUESTION SECTION:
+            ;abc.com.                       IN      A
+            ;; ANSWER SECTION:
+            a.abc.com.              0       IN      TXT ...
+            >>> DNSRecord.parse(t.pack()) == t
+            True
 
+            Original record is unchanged:
+
+            >>> len(a.rr)
+            3
+            >>> len(a.pack())
+            835
+            >>> a.header.tc
+            0
+
+            Truncating to exactly the packed size of a prefix keeps
+            everything up to that boundary (and no more):
+
+            >>> t = a.truncate(25 + 270 + 270)
+            >>> len(t.rr)
+            2
+            >>> len(t.pack()) == 25 + 270 + 270
+            True
+            >>> t.header.tc
+            1
+
+            If the record already fits nothing is removed and TC is
+            not set:
+
+            >>> t = a.truncate(835)
+            >>> len(t.rr)
+            3
+            >>> t.header.tc
+            0
+
+            Records with the same name/type/class form a single RRset
+            even when they are not adjacent - removing the trailing
+            group removes all its members (and the remaining records
+            are re-encoded with fresh compression pointers):
+
+            >>> b = q.reply()
+            >>> b.add_answer(*RR.fromZone('x.abc.com IN A 1.2.3.4'))
+            >>> b.add_answer(*RR.fromZone('y.x.abc.com IN A 5.6.7.8'))
+            >>> b.add_answer(*RR.fromZone('x.abc.com IN A 2.3.4.5'))
+            >>> len(b.pack())
+            77
+            >>> t = b.truncate(60)
+            >>> print(t)
+            ;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: ...
+            ;; flags: qr aa tc rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0
+            ;; QUESTION SECTION:
+            ;abc.com.                       IN      A
+            ;; ANSWER SECTION:
+            y.x.abc.com.            0       IN      A       5.6.7.8
+            >>> len(t.pack())
+            45
+            >>> DNSRecord.parse(t.pack()) == t
+            True
+
+            Groups are removed from the additional and authority
+            sections before the answer section:
+
+            >>> c = q.reply()
+            >>> c.add_answer(*RR.fromZone('a.abc.com IN TXT %s' % ('x' * 200)))
+            >>> c.add_auth(*RR.fromZone('ns.abc.com IN TXT %s' % ('y' * 200)))
+            >>> c.add_ar(*RR.fromZone('z.abc.com IN TXT %s' % ('z' * 200)))
+            >>> t = c.truncate(300)
+            >>> [(rr.rname,rr.rtype) for rr in t.rr]
+            [(<DNSLabel: 'a.abc.com.'>, 16)]
+            >>> len(t.auth)
+            0
+            >>> len(t.ar)
+            0
+            >>> t.header.tc
+            1
+
+            OPT pseudo-records are always retained and supply the
+            default size limit from their advertised UDP payload size:
+
+            >>> d = q.reply()
+            >>> d.add_answer(*RR.fromZone('a.abc.com IN TXT %s' % ('x' * 200)))
+            >>> d.add_answer(*RR.fromZone('b.abc.com IN TXT %s' % ('y' * 200)))
+            >>> d.add_ar(EDNS0(flags="do",udp_len=300))
+            >>> t = d.truncate()
+            >>> len(t.pack()) <= 300
+            True
+            >>> [rr.rtype for rr in t.ar]
+            [41]
+            >>> t.ar[0].edns_len
+            300
+            >>> len(t.rr)
+            1
+
+            An explicit max_len overrides the OPT advertised size:
+
+            >>> t = d.truncate(512)
+            >>> len(t.rr)
+            2
+
+            If even the header and question section (plus any OPT
+            records) exceed max_len a DNSError is raised rather than
+            returning an over-limit packet:
+
+            >>> d.truncate(10)
+            Traceback (most recent call last):
+            ...
+            DNSError: Error truncating DNSRecord: header/question section exceeds 10 byte limit
         """
-        return DNSRecord(DNSHeader(id=self.header.id,
-                                   bitmap=self.header.bitmap,
-                                   tc=1))
+        if max_len is None:
+            # Default to the UDP payload size advertised in the OPT
+            # pseudo-record (or the standard 512 byte UDP limit)
+            max_len = max([rr.edns_len for rr in self.ar
+                           if rr.rtype == QTYPE.OPT] or [512])
+        header = DNSHeader(id=self.header.id,bitmap=self.header.bitmap)
+        questions = copy.deepcopy(self.questions)
+        # OPT pseudo-records are not RRsets and are always retained
+        opt = copy.deepcopy([rr for rr in self.ar
+                             if rr.rtype == QTYPE.OPT])
+        sections = [
+            copy.deepcopy([rr for rr in self.ar
+                           if rr.rtype != QTYPE.OPT]),
+            copy.deepcopy(self.auth),
+            copy.deepcopy(self.rr),
+        ]
+        if len(DNSRecord(header,questions,ar=list(opt)).pack()) > max_len:
+            raise DNSError("Error truncating DNSRecord: header/question "
+                           "section exceeds %d byte limit" % max_len)
+        removed = False
+        while any(sections):
+            candidate = DNSRecord(header,questions,
+                                  rr=sections[2],auth=sections[1],
+                                  ar=sections[0] + opt)
+            if len(candidate.pack()) <= max_len:
+                break
+            # Remove the RRset containing the last record of the
+            # first non-empty section (additional,authority,answer)
+            for section in sections:
+                if section:
+                    last = section[-1]
+                    section[:] = [rr for rr in section
+                                  if (rr.rname,rr.rtype,rr.rclass) !=
+                                     (last.rname,last.rtype,last.rclass)]
+                    removed = True
+                    break
+        if removed:
+            header.tc = 1
+        return DNSRecord(header,questions,
+                         rr=sections[2],auth=sections[1],
+                         ar=sections[0] + opt)
 
     def send(self,dest,port=53,tcp=False,timeout=None,ipv6=False):
         """

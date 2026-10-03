@@ -185,7 +185,7 @@ class DNSHandler(socketserver.BaseRequestHandler):
         if self.protocol == 'udp':
             rdata = reply.pack()
             if self.udplen and len(rdata) > self.udplen:
-                truncated_reply = reply.truncate()
+                truncated_reply = reply.truncate(self.udplen)
                 rdata = truncated_reply.pack()
                 self.server.logger.log_truncated(self,truncated_reply)
         else:
