@@ -7,8 +7,8 @@
 
 from __future__ import print_function
 
-import base64,binascii,calendar,collections,copy,os.path,random,socket,\
-       string,struct,textwrap,time
+import base64,binascii,calendar,collections,copy,ipaddress,os.path,random,\
+       socket,string,struct,textwrap,time
 
 from itertools import chain
 
@@ -798,6 +798,182 @@ class EDNSOption(object):
             attrs = ('code','data')
             return all([getattr(self,x) == getattr(other,x) for x in attrs])
 
+class ECSOption(EDNSOption):
+
+    """
+        EDNS Client Subnet (ECS) option - RFC 7871 (option code 8)
+
+        Structured access to the ECS option data. The option can either be
+        created from an address/prefix:
+
+        >>> ECSOption("192.0.128.0",17)
+        <EDNS ECS: 192.0.128.0/17 scope 0>
+        >>> ECSOption("2001:db8::1")
+        <EDNS ECS: 2001:db8::1/128 scope 0>
+
+        or parsed from the raw option data (as found in EDNSOption.data):
+
+        >>> ECSOption(data=binascii.unhexlify(b"00011100c00080"))
+        <EDNS ECS: 192.0.128.0/17 scope 0>
+
+        The number of address bytes is derived from the source prefix length
+        and bits beyond the prefix must be zero (RFC 7871 section 6):
+
+        >>> ECSOption(data=binascii.unhexlify(b"00011100c00001"))
+        Traceback (most recent call last):
+        ...
+        DNSError: Error: ECS address has non-zero bits beyond source prefix length /17
+
+        Zero length prefixes carry no address bytes:
+
+        >>> ECSOption("0.0.0.0",0)
+        <EDNS ECS: 0.0.0.0/0 scope 0>
+        >>> ECSOption("::",0)
+        <EDNS ECS: ::/0 scope 0>
+    """
+
+    CODE = 8
+    FAMILY_IPV4 = 1
+    FAMILY_IPV6 = 2
+    _MAX_PREFIX = { FAMILY_IPV4 : 32, FAMILY_IPV6 : 128 }
+    _ADDR_BYTES = { FAMILY_IPV4 : 4, FAMILY_IPV6 : 16 }
+
+    def __init__(self,address=None,srclen=None,scopelen=0,data=None):
+        self.code = self.CODE
+        if data is not None:
+            self._parse(data)
+        else:
+            addr = ipaddress.ip_address(address)
+            self.family = self.FAMILY_IPV4 if addr.version == 4 \
+                                        else self.FAMILY_IPV6
+            max_prefix = self._MAX_PREFIX[self.family]
+            if srclen is None:
+                srclen = max_prefix
+            self._check_prefix("source",srclen,max_prefix)
+            self._check_prefix("scope",scopelen,max_prefix)
+            self.srclen = srclen
+            self.scopelen = scopelen
+            nbytes = (srclen + 7) // 8
+            self.addr = self._mask(addr.packed[:nbytes],srclen)
+
+    @staticmethod
+    def _check_prefix(name,prefixlen,max_prefix):
+        if not 0 <= prefixlen <= max_prefix:
+            raise DNSError("Error: ECS %s prefix length must be between "
+                           "0-%d [%d]" % (name,max_prefix,prefixlen))
+
+    @staticmethod
+    def _mask(addr,prefixlen):
+        # Zero bits beyond prefixlen in the last (partial) address byte
+        rem = prefixlen % 8
+        if rem and addr:
+            addr = addr[:-1] + bytes(bytearray([addr[-1] & (0xff << (8 - rem)) & 0xff]))
+        return addr
+
+    def _parse(self,data):
+        if len(data) < 4:
+            raise DNSError("Error: ECS option data too short [%d bytes]" %
+                                len(data))
+        family,srclen,scopelen = struct.unpack("!HBB",data[:4])
+        addr = bytes(data[4:])
+        if family not in self._MAX_PREFIX:
+            raise DNSError("Error: unsupported ECS address family [%d]" %
+                                family)
+        max_prefix = self._MAX_PREFIX[family]
+        self._check_prefix("source",srclen,max_prefix)
+        self._check_prefix("scope",scopelen,max_prefix)
+        nbytes = (srclen + 7) // 8
+        if len(addr) != nbytes:
+            raise DNSError("Error: ECS address length %d does not match "
+                           "source prefix length /%d (expected %d bytes)" %
+                                (len(addr),srclen,nbytes))
+        if addr != self._mask(addr,srclen):
+            raise DNSError("Error: ECS address has non-zero bits beyond "
+                           "source prefix length /%d" % srclen)
+        self.family = family
+        self.srclen = srclen
+        self.scopelen = scopelen
+        self.addr = addr
+
+    @property
+    def data(self):
+        return struct.pack("!HBB",self.family,self.srclen,self.scopelen) + \
+                                self.addr
+
+    def _network(self,prefixlen):
+        full = self.addr + \
+                b"\x00" * (self._ADDR_BYTES[self.family] - len(self.addr))
+        return ipaddress.ip_network((full,prefixlen),strict=False)
+
+    @property
+    def source_network(self):
+        """
+            The client source prefix as an ipaddress network object
+        """
+        return self._network(self.srclen)
+
+    @property
+    def scope_network(self):
+        """
+            The cache scope declared in a response as an ipaddress network
+            object (suitable for partitioning an ECS-aware cache)
+        """
+        return self._network(self.scopelen)
+
+    def cache_key(self):
+        """
+            Hashable key identifying the cache partition for this option
+            (address family + scope network)
+        """
+        return (self.family,str(self.scope_network))
+
+    def matches_query(self,query):
+        """
+            Check the response/query correspondence required by RFC 7871
+            section 7.3 - FAMILY, SOURCE PREFIX-LENGTH and ADDRESS in the
+            response must match the query
+        """
+        return (self.family == query.family and
+                self.srclen == query.srclen and
+                self.addr == query.addr)
+
+    def validate_response(self,query):
+        """
+            Raise DNSError unless this (response) option matches the source
+            prefix of the query option (see matches_query)
+        """
+        if not self.matches_query(query):
+            raise DNSError("Error: ECS response %s does not match query "
+                           "source prefix %s" % (self,query))
+
+    def covers(self,query):
+        """
+            Check whether the cache scope declared in this (response) option
+            covers the source prefix of a query option. A cached response
+            may only be reused for queries whose source prefix falls within
+            the response scope - a broader response is not a valid answer
+            for arbitrary queries outside that scope.
+        """
+        if self.family != query.family:
+            return False
+        scope = self.scope_network
+        qnet = query.source_network
+        return qnet.prefixlen >= scope.prefixlen and \
+                qnet.network_address in scope
+
+    def _addr_str(self):
+        full = self.addr + \
+                b"\x00" * (self._ADDR_BYTES[self.family] - len(self.addr))
+        return str(ipaddress.ip_address(full))
+
+    def __repr__(self):
+        return "<EDNS ECS: %s/%d scope %d>" % (
+                    self._addr_str(),self.srclen,self.scopelen)
+
+    def toZone(self):
+        return "; CLIENT-SUBNET: %s/%d/%d" % (
+                    self._addr_str(),self.srclen,self.scopelen)
+
 class RR(object):
 
     """
@@ -850,6 +1026,9 @@ class RR(object):
         if self.rtype == QTYPE.OPT:
             if not isinstance(rdata,list) or any([not isinstance(rd,EDNSOption) for rd in rdata]):
                 raise DNSError("Error: OPT Record expects list of EDNSOption objects")
+            if sum([1 for rd in rdata if rd.code == ECSOption.CODE]) > 1:
+                raise DNSError("Error: OPT record contains multiple ECS "
+                               "(CLIENT-SUBNET) options")
         elif not isinstance(rdata,RD):
             raise DNSError("Error: RDATA must be RD instance [%s]" % type(rdata).__name__)
         self.rdata = rdata
