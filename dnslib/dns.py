@@ -117,12 +117,19 @@ class DNSRecord(object):
             rr = []
             auth = []
             ar = []
+            # RFC2136 UPDATE requests reuse the answer/authority sections
+            # for prerequisites/updates which legitimately contain
+            # zero-length RDATA (see RFC2136 sections 2.4/2.5). The
+            # additional section of any packet (and every section of a
+            # normal query/response) must never contain empty RDATA.
+            update_request = (header.opcode == OPCODE.UPDATE and
+                              header.qr == QR.QUERY)
             for i in range(header.q):
                 questions.append(DNSQuestion.parse(buffer))
             for i in range(header.a):
-                rr.append(RR.parse(buffer))
+                rr.append(RR.parse(buffer,allow_empty=update_request))
             for i in range(header.auth):
-                auth.append(RR.parse(buffer))
+                auth.append(RR.parse(buffer,allow_empty=update_request))
             for i in range(header.ar):
                 ar.append(RR.parse(buffer))
             return cls(header,questions,rr,auth=auth,ar=ar)
@@ -318,15 +325,36 @@ class DNSRecord(object):
             >>> a = q.replyZone("abc.com A 1.2.3.4")
             >>> a.header.aa = 0
             >>> pkt = a.pack()
-            >>> print(DNSRecord.parse(pkt))
-            ;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1234
-            ;; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0
-            ;; QUESTION SECTION:
-            ;abc.com.                       IN      A
-            ;; ANSWER SECTION:
-            abc.com.                0       IN      A       1.2.3.4
+        >>> print(DNSRecord.parse(pkt))
+        ;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1234
+        ;; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0
+        ;; QUESTION SECTION:
+        ;abc.com.                       IN      A
+        ;; ANSWER SECTION:
+        abc.com.                0       IN      A       1.2.3.4
         """
         self.set_header_qa()
+        # RFC2136: zero-length RDATA is only legal inside the
+        # prerequisite/answer and update/authority sections of an
+        # UPDATE *request*. Reject it everywhere else (in particular an
+        # empty A/MX record in a normal query response must never be
+        # emitted).
+        update_request = (self.header.opcode == OPCODE.UPDATE and
+                          self.header.qr == QR.QUERY)
+        for section,records in (('answer',self.rr),
+                                ('authority',self.auth),
+                                ('additional',self.ar)):
+            for record in records:
+                if record.rtype != QTYPE.OPT and _rr_is_empty(record):
+                    if not (update_request and section in ('answer','authority')):
+                        context = ('UPDATE request'
+                                   if self.header.opcode == OPCODE.UPDATE
+                                   else 'query/response')
+                        raise DNSError(
+                            "Error: zero-length RDATA is not permitted in "
+                            "%s section of %s opcode=%s packet" % (
+                                section,context,
+                                OPCODE.get(self.header.opcode)))
         buffer = DNSBuffer()
         self.header.pack(buffer)
         for q in self.questions:
@@ -811,7 +839,7 @@ class RR(object):
     rdlength = H('rdlength')
 
     @classmethod
-    def parse(cls,buffer):
+    def parse(cls,buffer,allow_empty=False):
         try:
             rname = buffer.decode_name()
             rtype,rclass,ttl,rdlength = buffer.unpack("!HHIH")
@@ -828,7 +856,14 @@ class RR(object):
                     rdata = RDMAP.get(QTYPE.get(rtype),RD).parse(
                                             buffer,rdlength)
                 else:
-                    raise DNSError("Error: Empty RR")
+                    # Zero-length RDATA is only legal in the prerequisite
+                    # / update sections of an RFC2136 UPDATE request
+                    # (the caller must explicitly opt in via allow_empty).
+                    # It is always an error in a normal query/response.
+                    if allow_empty:
+                        rdata = EmptyRD()
+                    else:
+                        raise DNSError("Error: Empty RR")
             return cls(rname,rtype,rclass,ttl,rdata)
         except (BufferError,BimapError) as e:
             raise DNSError("Error unpacking RR [offset=%d]: %s" % (
@@ -1014,6 +1049,10 @@ class RD(object):
         blob (this allows round-trip encoding/decoding)
     """
 
+    # Subclassed by EmptyRD which legitimately encodes zero-length RDATA
+    # inside an RFC2136 UPDATE request
+    is_empty = False
+
     @classmethod
     def parse(cls,buffer,length):
         """
@@ -1073,6 +1112,52 @@ class RD(object):
 
     def __ne__(self,other):
         return not(self.__eq__(other))
+
+class EmptyRD(RD):
+    """
+        Zero-length RDATA marker used exclusively in the prerequisite and
+        update sections of an RFC2136 UPDATE request (e.g. 'name in use',
+        'rrset does not exist', 'delete name', 'delete rrset').
+
+        It must never appear in a normal query/response (an empty A or MX
+        record remains invalid); the section-aware checks in
+        DNSRecord.pack/DNSRecord.parse enforce this.
+
+        >>> buf = DNSBuffer()
+        >>> EmptyRD().pack(buf)
+        >>> bytes(buf.data)
+        b''
+        >>> len(EmptyRD().data)
+        0
+    """
+
+    # Explicitly marks the RR as carrying no RDATA on the wire
+    is_empty = True
+
+    def __init__(self):
+        self.data = b""
+
+    def pack(self,buffer):
+        # Nothing to append - rdlength stays 0
+        return
+
+    def __repr__(self):
+        return "\\# 0"
+
+def _rr_is_empty(record):
+    """
+        Return True if the RR carries zero-length RDATA on the wire.
+
+        EmptyRD is the explicit RFC2136 marker; a generic RD holding an
+        empty byte string is treated the same way.
+    """
+    if getattr(record,'rtype',None) == QTYPE.OPT:
+        return False
+    if isinstance(getattr(record,'rdata',None),EmptyRD):
+        return True
+    rdata = getattr(record,'rdata',None)
+    return isinstance(rdata,RD) and not isinstance(rdata,EmptyRD) and \
+           getattr(rdata,'data',None) == b""
 
 def _force_bytes(x):
     if isinstance(x,bytes):

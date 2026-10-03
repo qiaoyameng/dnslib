@@ -430,6 +430,12 @@ Master Repository/Issues:
 
 from dnslib.dns import *
 
+from dnslib.update import (DNSUpdate,
+                           RRsetExists, NameInUse, RRsetAbsent,
+                           NameNotInUse, RRsetValue,
+                           AddRecord, DeleteName, DeleteRRset, DeleteRecord,
+                           EmptyRD, CLASS_NONE)
+
 version = "0.9.26"
 
 if __name__ == '__main__':
