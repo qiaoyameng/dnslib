@@ -144,6 +144,8 @@ class WordLexer(Lexer):
 
         To emit SPACE tokens: self.spacetok = ('SPACE',None)
         To emit NL tokens: self.nltok = ('NL',None)
+        To emit a separate token type for quoted strings (rather than
+        'ATOM') set self.quotetok to the token name (e.g. 'QUOTED')
 
         >>> l = WordLexer(r'abc "def\100\x3d\\. ghi" jkl')
         >>> list(l)
@@ -151,6 +153,10 @@ class WordLexer(Lexer):
         >>> l = WordLexer(r"1 '2 3 4' 5")
         >>> list(l)
         [('ATOM', '1'), ('ATOM', '2 3 4'), ('ATOM', '5')]
+        >>> l = WordLexer('abc "def ghi" jkl')
+        >>> l.quotetok = 'QUOTED'
+        >>> list(l)
+        [('ATOM', 'abc'), ('QUOTED', 'def ghi'), ('ATOM', 'jkl')]
         >>> l = WordLexer("abc# a comment")
         >>> list(l)
         [('ATOM', 'abc'), ('COMMENT', 'a comment')]
@@ -164,6 +170,7 @@ class WordLexer(Lexer):
     nlchars = set('\r\n')
     spacetok = None
     nltok = None
+    quotetok = None
 
     def lexStart(self):
         return (None,self.lexSpace)
@@ -233,7 +240,7 @@ class WordLexer(Lexer):
 
     def lexQuote(self):
         s = []
-        tok = lambda n : (('ATOM',''.join(s)),n)
+        tok = lambda n : ((self.quotetok or 'ATOM',''.join(s)),n)
         q = self.read(1)
         while not self.eof:
             c = self.readescaped()
