@@ -429,6 +429,7 @@ Master Repository/Issues:
 """
 
 from dnslib.dns import *
+from dnslib.ixfr import IXFRError,ZoneUpdater,apply_update,serial_add,serial_lt,serial_le,serial_gt,serial_ge
 
 version = "0.9.26"
 
