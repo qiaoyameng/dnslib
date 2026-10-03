@@ -798,6 +798,272 @@ class EDNSOption(object):
             attrs = ('code','data')
             return all([getattr(self,x) == getattr(other,x) for x in attrs])
 
+def _ecs_parse_address(address):
+    """
+        Parse an IPv4/IPv6 address (text or packed bytes) and return a
+        (family,packed) tuple where family is the RFC 7871 address family
+        (1 = IPv4, 2 = IPv6) and packed the full length address bytes.
+    """
+    if isinstance(address,(bytes,bytearray)) and len(address) in (4,16):
+        packed = bytes(address)
+        return (1 if len(packed) == 4 else 2),packed
+    try:
+        return 1,socket.inet_pton(socket.AF_INET,address)
+    except (socket.error,TypeError):
+        try:
+            return 2,socket.inet_pton(socket.AF_INET6,address)
+        except (socket.error,TypeError):
+            raise ValueError("Invalid ECS address [%r]" % (address,))
+
+def _ecs_mask(packed,prefixlen):
+    """
+        Return full length address bytes with all bits beyond prefixlen
+        cleared (network base address).
+    """
+    nbytes = (prefixlen + 7) // 8
+    masked = bytearray(packed[:nbytes])
+    if prefixlen % 8:
+        masked[-1] &= (0xFF << (8 - prefixlen % 8)) & 0xFF
+    return bytes(masked) + b"\x00" * (len(packed) - nbytes)
+
+class ECSNetwork(object):
+
+    """
+        Network prefix derived from an ECS option (RFC 7871).
+
+        This is the canonical "address/prefixlen" representation used to
+        partition cached answers - two ECS options describing the same
+        network compare (and hash) equal regardless of the address bits
+        originally present beyond the prefix.
+
+        >>> n = ECSNetwork(socket.inet_pton(socket.AF_INET,"192.0.2.130"),24)
+        >>> print(n)
+        192.0.2.0/24
+        >>> n.contains("192.0.2.77")
+        True
+        >>> n.contains("192.0.3.1")
+        False
+        >>> n.contains("2001:db8::1")
+        False
+        >>> ECSNetwork(socket.inet_pton(socket.AF_INET6,"2001:db8:abcd:1234::"),57)
+        ECSNetwork('2001:db8:abcd:1200::/57')
+    """
+
+    def __init__(self,packed,prefixlen):
+        maxbits = len(packed) * 8
+        if not (isinstance(prefixlen,int) and 0 <= prefixlen <= maxbits):
+            raise ValueError("Invalid prefix length /%s for %d-bit address" %
+                                        (prefixlen,maxbits))
+        self.prefixlen = prefixlen
+        self._packed = _ecs_mask(packed,prefixlen)
+
+    @property
+    def address(self):
+        """
+            Canonical text form of the network base address.
+        """
+        family = socket.AF_INET if len(self._packed) == 4 else socket.AF_INET6
+        return socket.inet_ntop(family,self._packed)
+
+    def contains(self,address):
+        """
+            Check whether address (text or packed bytes) falls inside this
+            network. An address from a different address family is never
+            contained.
+        """
+        _,packed = _ecs_parse_address(address)
+        if len(packed) != len(self._packed):
+            return False
+        return _ecs_mask(packed,self.prefixlen) == self._packed
+
+    def __str__(self):
+        return "%s/%d" % (self.address,self.prefixlen)
+
+    def __repr__(self):
+        return "ECSNetwork('%s')" % self
+
+    def __ne__(self,other):
+        return not(self.__eq__(other))
+
+    def __eq__(self,other):
+        if type(other) != type(self):
+            return False
+        return (self.prefixlen,self._packed) == (other.prefixlen,other._packed)
+
+    def __hash__(self):
+        return hash((self.prefixlen,self._packed))
+
+class ECSOption(EDNSOption):
+
+    """
+        EDNS Client Subnet (ECS) option - RFC 7871
+
+        Structured access to the ECS option (option code 8). The wire
+        format is:
+
+            FAMILY (2 octets) | SOURCE PREFIX-LENGTH (1 octet) |
+            SCOPE PREFIX-LENGTH (1 octet) | ADDRESS (variable)
+
+        The ADDRESS field is truncated to SOURCE PREFIX-LENGTH bits
+        (padded to a whole octet) so the number of address octets varies
+        with the source prefix length. Bits beyond the source prefix must
+        be zero - non-zero trailing bits are rejected when parsing.
+
+        >>> opt = ECSOption("192.0.2.130",24)
+        >>> print(opt)
+        ; CLIENT-SUBNET: 192.0.2.0/24/0
+        >>> binascii.hexlify(opt.data).decode()
+        '00011800c00002'
+        >>> ECSOption.from_data(opt.data) == opt
+        True
+        >>> ECSOption("2001:db8::1",0).data
+        b'\\x00\\x02\\x00\\x00'
+        >>> ECSOption.from_data(b"\\x00\\x01\\x11\\x00\\xc0\\x00\\x01")
+        Traceback (most recent call last):
+        ...
+        DNSError: Error unpacking ECS option: non-zero bits beyond source prefix /17
+        >>> ECSOption.from_data(b"\\x00\\x03\\x00\\x00")
+        Traceback (most recent call last):
+        ...
+        DNSError: Error unpacking ECS option: unsupported address family [3]
+    """
+
+    def __init__(self,address,srclen=None,scopelen=0):
+        family,packed = _ecs_parse_address(address)
+        maxbits = len(packed) * 8
+        if srclen is None:
+            srclen = maxbits
+        check_range("srclen",srclen,0,maxbits)
+        check_range("scopelen",scopelen,0,maxbits)
+        self.code = 8
+        self._packed = bytes(packed)
+        self.srclen = srclen
+        self.scopelen = scopelen
+
+    @classmethod
+    def from_data(cls,data):
+        """
+            Parse the wire format option payload (everything after the
+            option code/length header) and return an ECSOption.
+
+            Raises DNSError for malformed options (unknown address family,
+            prefix longer than the address, wrong number of address octets
+            or non-zero bits beyond the source prefix).
+        """
+        try:
+            if len(data) < 4:
+                raise DNSError("truncated header")
+            family,srclen,scopelen = struct.unpack("!HBB",data[:4])
+            if family == 1:
+                maxbits = 32
+            elif family == 2:
+                maxbits = 128
+            else:
+                raise DNSError("unsupported address family [%d]" % family)
+            if srclen > maxbits:
+                raise DNSError("source prefix /%d too long for family %d" %
+                                        (srclen,family))
+            if scopelen > maxbits:
+                raise DNSError("scope prefix /%d too long for family %d" %
+                                        (scopelen,family))
+            nbytes = (srclen + 7) // 8
+            addr = bytearray(data[4:])
+            if len(addr) != nbytes:
+                raise DNSError("expected %d address octets for source "
+                               "prefix /%d (got %d)" %
+                                        (nbytes,srclen,len(addr)))
+            if srclen % 8 and addr and (addr[-1] & (0xFF >> (srclen % 8))):
+                raise DNSError("non-zero bits beyond source prefix /%d" %
+                                        srclen)
+            packed = bytes(addr) + b"\x00" * (maxbits // 8 - nbytes)
+            return cls(packed,srclen,scopelen)
+        except DNSError as e:
+            raise DNSError("Error unpacking ECS option: %s" % e)
+
+    @property
+    def data(self):
+        nbytes = (self.srclen + 7) // 8
+        addr = _ecs_mask(self._packed,self.srclen)[:nbytes]
+        return struct.pack("!HBB",self.family,self.srclen,self.scopelen) + addr
+
+    @property
+    def family(self):
+        return 1 if len(self._packed) == 4 else 2
+
+    @property
+    def address(self):
+        """
+            Text form of the client address (bits beyond the source prefix
+            are always zero).
+        """
+        family = socket.AF_INET if self.family == 1 else socket.AF_INET6
+        return socket.inet_ntop(family,_ecs_mask(self._packed,self.srclen))
+
+    @property
+    def source_network(self):
+        """
+            The client network identified by the source prefix.
+        """
+        return ECSNetwork(self._packed,self.srclen)
+
+    @property
+    def scope_network(self):
+        """
+            The network a response may be cached under (RFC 7871 SCOPE
+            PREFIX-LENGTH). Only meaningful in responses - in queries the
+            scope prefix is always /0.
+        """
+        return ECSNetwork(self._packed,self.scopelen)
+
+    def toZone(self):
+        return "; CLIENT-SUBNET: %s/%d/%d" % (
+                        self.address,self.srclen,self.scopelen)
+
+    def __repr__(self):
+        return "<EDNS ECS: %s/%d scope/%d>" % (
+                        self.address,self.srclen,self.scopelen)
+
+def check_ecs_response(query,response):
+    """
+        Validate that the ECS option in a response corresponds to the ECS
+        option sent in the query (RFC 7871 section 7.3) and return the
+        ECSNetwork the answer may be cached under.
+
+        The response must echo the query's address family, source prefix
+        length and source prefix exactly - a response to a different
+        client prefix is rejected rather than being treated as an answer
+        to an arbitrary query.
+
+        The declared cache scope (SCOPE PREFIX-LENGTH) may be shorter
+        than the source prefix, in which case the answer covers a broader
+        range of clients than was queried for. The returned network
+        should be used to partition the cache: a cached answer may only
+        be reused for clients whose address is contained in it (see
+        ECSNetwork.contains) - it is not an answer to arbitrary queries.
+
+        Returns None if the response declares a scope of /0: the answer
+        is specific to the querying client and must not be cached or used
+        to answer other queries (RFC 7871 section 7.2.1).
+
+        Raises DNSError if the response does not correspond to the query.
+    """
+    if not isinstance(query,ECSOption) or not isinstance(response,ECSOption):
+        raise DNSError("check_ecs_response expects ECSOption instances")
+    if query.family != response.family:
+        raise DNSError("ECS response family %d does not match query "
+                       "family %d" % (response.family,query.family))
+    if query.srclen != response.srclen:
+        raise DNSError("ECS response source prefix /%d does not match "
+                       "query source prefix /%d" %
+                            (response.srclen,query.srclen))
+    if query.source_network != response.source_network:
+        raise DNSError("ECS response client prefix %s does not match "
+                       "query client prefix %s" %
+                            (response.source_network,query.source_network))
+    if response.scopelen == 0:
+        return None
+    return response.scope_network
+
 class RR(object):
 
     """
@@ -818,10 +1084,19 @@ class RR(object):
             if rtype == QTYPE.OPT:
                 options = []
                 option_buffer = Buffer(buffer.get(rdlength))
+                ecs_seen = False
                 while option_buffer.remaining() > 4:
                     code,length = option_buffer.unpack("!HH")
                     data = option_buffer.get(length)
-                    options.append(EDNSOption(code,data))
+                    if code == 8:
+                        # RFC 7871 - at most one ECS option per OPT record
+                        if ecs_seen:
+                            raise DNSError("Error: duplicate ECS option "
+                                           "in OPT record")
+                        ecs_seen = True
+                        options.append(ECSOption.from_data(data))
+                    else:
+                        options.append(EDNSOption(code,data))
                 rdata = options
             else:
                 if rdlength:
